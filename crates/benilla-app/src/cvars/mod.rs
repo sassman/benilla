@@ -3225,8 +3225,9 @@ mod tests {
 
     /// The string-valued rows, a closed list, each default checked on its own terms: `realmName`
     /// and `accountName` (the reference's registered `""`, `0x882748`) and `gxApi` are empty until
-    /// the session or the login screen writes them; `gxResolution` and `realmList` pass their callbacks' parsers
-    /// ([`crate::video::parse_resolution`], [`crate::realmlist::normalize`]).
+    /// the session or the login screen writes them; `gxResolution`, `realmList` and `logonHandshake`
+    /// pass their callbacks' parsers ([`crate::video::parse_resolution`],
+    /// [`crate::realmlist::normalize`], [`crate::logon_handshake::parse`]).
     #[test]
     fn the_string_valued_cvars_are_the_realm_and_the_windowed_size() {
         let mut strings: Vec<&str> = REGISTERED
@@ -3241,6 +3242,7 @@ mod tests {
                 "accountName",
                 "gxApi",
                 "gxResolution",
+                "logonHandshake",
                 "realmList",
                 "realmName"
             ]
@@ -3255,6 +3257,7 @@ mod tests {
         assert_eq!(default_of("realmName"), "");
         assert_eq!(default_of("accountName"), "");
         assert_eq!(default_of("gxApi"), "");
+        assert!(crate::logon_handshake::parse(default_of("logonHandshake")).is_some());
         assert_eq!(
             crate::video::parse_resolution(default_of("gxResolution")),
             Some(crate::video::DEFAULT_WINDOWED)

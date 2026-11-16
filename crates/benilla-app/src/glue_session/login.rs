@@ -106,11 +106,14 @@ pub(crate) struct Attempt<'w> {
     submit: Res<'w, LoginSubmit>,
     abandon: Res<'w, LoginAbandon>,
     pub(crate) realmlist: Res<'w, crate::realmlist::Realmlist>,
+    /// Absent in an app with no CVar table, which then speaks the stock handshake.
+    cvars: Option<Res<'w, crate::cvars::Cvars>>,
 }
 
 impl Attempt<'_> {
     /// Send one login attempt to the parked IO thread, stamped with the abandon generation. The
-    /// realmlist is read at submit time, so an attempt keeps the server it started with.
+    /// realmlist and the handshake are read at submit time, so an attempt keeps what it started
+    /// with.
     /// `announced` says a screen sent it: a person typed it.
     pub(crate) fn send(&mut self, user: &str, pass: &str, announced: bool) {
         self.intent.creds = Some((user.to_string(), pass.to_string()));
@@ -122,6 +125,11 @@ impl Attempt<'_> {
             pass: pass.to_string(),
             host: self.realmlist.address().to_string(),
             locale: crate::ui_script::client_locale().tag(),
+            handshake: crate::logon_handshake::applied(
+                self.cvars
+                    .as_ref()
+                    .and_then(|cvars| cvars.get(crate::logon_handshake::CVAR_LOGON_HANDSHAKE)),
+            ),
             generation: self.abandon.0.load(Ordering::SeqCst),
         });
     }

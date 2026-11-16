@@ -345,3 +345,196 @@ fn a_prompt_that_gives_no_pin_ends_the_logon() {
     assert!(format!("{e:#}").contains("cancelled"), "{e:#}");
     assert!(proofs.try_recv().is_err(), "no proof went out");
 }
+
+// ── The strong logon ─────────────────────────────────────────────────────────────────────────────
+
+mod strong {
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+
+    use benilla_protocol::auth::strong::PROTOCOL_VERSION;
+    use benilla_protocol::{auth, Handshake, StrongUnsupported};
+    use srp6::{Group4096, Srp6_4096, Username};
+
+    use super::{challenge_packet, realm_list_packet, B, CRC_SALT};
+
+    const USER: &str = "probe";
+    const PASS: &str = "secret";
+
+    fn u16_prefixed(bytes: &[u8]) -> Vec<u8> {
+        let mut out = (bytes.len() as u16).to_le_bytes().to_vec();
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    /// Reads the client's logon challenge and returns its protocol byte.
+    fn read_challenge(s: &mut impl Read) -> u8 {
+        let mut head = [0u8; 4];
+        s.read_exact(&mut head).unwrap();
+        let mut body = vec![0u8; usize::from(u16::from_le_bytes([head[2], head[3]]))];
+        s.read_exact(&mut body).unwrap();
+        head[1]
+    }
+
+    /// A realmd that speaks the strong logon for [`USER`], whose password is `password`: the
+    /// challenge, the proof judged with real SRP6, then the one-realm list. Hands back its
+    /// address and, once a proof verified, the session key it derived.
+    fn strong_realmd(password: &'static str) -> (String, mpsc::Receiver<Vec<u8>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            assert_eq!(read_challenge(&mut s), PROTOCOL_VERSION);
+
+            let srp = Srp6_4096::default();
+            // The identity is the name as the challenge carries it: uppercased.
+            let user = Username::new(USER.to_uppercase()).unwrap();
+            let (salt, verifier) = srp.generate_new_user_secrets(&user, password);
+            let (handshake, proof_verifier) = srp.start_handshake(&user, salt, verifier).unwrap();
+
+            let mut challenge = vec![0x00, PROTOCOL_VERSION, 0x00];
+            challenge.extend(u16_prefixed(handshake.public_key().as_bytes()));
+            challenge.extend([1, 5]); // generator: length, value
+            challenge.extend(u16_prefixed(srp.modulus().as_bytes()));
+            challenge.push(handshake.salt().as_bytes().len() as u8);
+            challenge.extend_from_slice(handshake.salt().as_bytes());
+            challenge.extend_from_slice(&CRC_SALT);
+            challenge.push(0); // security_flag = None
+            s.write_all(&challenge).unwrap();
+
+            // opcode, A behind its length, M1 behind its length, crc_hash, keys, security byte
+            let mut proof = [0u8; 1 + 2 + 512 + 2 + 64 + 20 + 1 + 1];
+            s.read_exact(&mut proof).unwrap();
+            assert_eq!(proof[0], 0x01);
+            assert_eq!(u16::from_le_bytes([proof[1], proof[2]]), 512);
+            assert_eq!(u16::from_le_bytes([proof[515], proof[516]]), 64);
+            let client = srp6::HandshakeProof::<Group4096, srp6::DefaultHash>::from_wire(
+                srp6::PublicKey::try_from_bytes(&proof[3..515]).unwrap(),
+                srp6::Proof::try_from_bytes(&proof[517..581]).unwrap(),
+            );
+
+            match srp.verify_proof(&proof_verifier, &client) {
+                Ok(srp6::ServerProof {
+                    strong_proof: m2,
+                    session_key: key,
+                }) => {
+                    let mut reply = vec![0x01, 0x00];
+                    reply.extend(u16_prefixed(m2.as_bytes()));
+                    reply.extend_from_slice(&0u32.to_le_bytes()); // hardware_survey_id
+                    s.write_all(&reply).unwrap();
+                    tx.send(key.as_bytes().to_vec()).unwrap();
+                    s.read_exact(&mut [0u8; 5]).unwrap();
+                    s.write_all(&realm_list_packet()).unwrap();
+                }
+                Err(_) => s.write_all(&[0x01, 0x04]).unwrap(),
+            }
+            let _ = s.read(&mut [0u8; 1]);
+        });
+        (addr, rx)
+    }
+
+    fn logon(addr: &str) -> anyhow::Result<benilla_protocol::Logon> {
+        benilla_protocol::logon_as(addr, USER, PASS, auth::LOCALE_TAG_EN_US, Handshake::Strong)
+    }
+
+    /// Both ends prove themselves over the strong packets and hold the same 128-byte key.
+    #[test]
+    fn a_strong_logon_shares_a_key_with_a_server_that_speaks_it() {
+        let (addr, keys) = strong_realmd(PASS);
+        let logon = logon(&addr).expect("the strong logon succeeds");
+
+        assert_eq!(logon.realms.len(), 1);
+        assert_eq!(logon.session_key.as_bytes().len(), 128);
+        assert_eq!(logon.session_key.as_bytes(), keys.recv().unwrap());
+    }
+
+    #[test]
+    fn a_wrong_password_is_refused_by_the_strong_proof() {
+        let (addr, _keys) = strong_realmd("another");
+        let e = logon(&addr).err().expect("refused");
+        let r = e.downcast_ref::<benilla_protocol::AuthReject>().unwrap();
+        assert_eq!(
+            (r.code, r.reply),
+            (0x04, benilla_protocol::LogonReply::Proof)
+        );
+    }
+
+    /// A realmd that answers a strong challenge in the stock protocol does not know the
+    /// handshake. The logon ends there: no proof goes out, and nothing falls back to the stock
+    /// handshake, so whoever sits between the two cannot force it.
+    #[test]
+    fn a_server_that_answers_in_the_stock_protocol_ends_the_logon() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            assert_eq!(read_challenge(&mut s), PROTOCOL_VERSION);
+            s.write_all(&challenge_packet(&B, &[3u8; 32])).unwrap();
+            // Whatever the client sends next; the end of the stream if it sends nothing.
+            let mut next = Vec::new();
+            let _ = s.read_to_end(&mut next);
+            tx.send(next).unwrap();
+        });
+
+        let e = logon(&addr).err().expect("the logon ends");
+        assert_eq!(
+            e.downcast_ref::<StrongUnsupported>(),
+            Some(&StrongUnsupported { answered: 0 })
+        );
+        drop(e);
+        assert_eq!(rx.recv().unwrap(), Vec::<u8>::new(), "no proof went out");
+    }
+
+    /// A PIN's proof would travel with `M1`, before the server has proved itself: a challenge
+    /// that asks for one ends the strong logon with nothing sent, the PIN's hash least of all.
+    #[test]
+    fn a_strong_challenge_that_asks_for_a_pin_ends_the_logon() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            assert_eq!(read_challenge(&mut s), PROTOCOL_VERSION);
+
+            let srp = Srp6_4096::default();
+            // The identity is the name as the challenge carries it: uppercased.
+            let user = Username::new(USER.to_uppercase()).unwrap();
+            let (salt, verifier) = srp.generate_new_user_secrets(&user, PASS);
+            let (handshake, _) = srp.start_handshake(&user, salt, verifier).unwrap();
+            let mut challenge = vec![0x00, PROTOCOL_VERSION, 0x00];
+            challenge.extend(u16_prefixed(handshake.public_key().as_bytes()));
+            challenge.extend([1, 5]); // generator: length, value
+            challenge.extend(u16_prefixed(srp.modulus().as_bytes()));
+            challenge.push(handshake.salt().as_bytes().len() as u8);
+            challenge.extend_from_slice(handshake.salt().as_bytes());
+            challenge.extend_from_slice(&CRC_SALT);
+            challenge.push(1); // security_flag = PIN
+            challenge.extend_from_slice(&7u32.to_le_bytes()); // grid seed
+            challenge.extend_from_slice(&[9u8; 16]); // PIN salt
+            s.write_all(&challenge).unwrap();
+
+            let mut next = Vec::new();
+            let _ = s.read_to_end(&mut next);
+            tx.send(next).unwrap();
+        });
+
+        let e = logon(&addr).err().expect("the logon ends");
+        assert!(format!("{e:#}").contains("PIN"), "{e:#}");
+        drop(e);
+        assert_eq!(rx.recv().unwrap(), Vec::<u8>::new(), "no proof went out");
+    }
+
+    /// A length no strong value has is refused from the prefix, not waited on or allocated for.
+    #[test]
+    fn a_public_key_longer_than_the_group_is_refused() {
+        let mut packet = vec![0x00, PROTOCOL_VERSION, 0x00];
+        packet.extend_from_slice(&513u16.to_le_bytes());
+        let mut stream: &[u8] = &packet;
+        let e = auth::strong::read_challenge_reply(&mut stream)
+            .err()
+            .expect("refused");
+        assert!(format!("{e:#}").contains("513"), "{e:#}");
+    }
+}

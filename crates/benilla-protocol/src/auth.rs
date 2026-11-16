@@ -14,6 +14,7 @@ use crate::wire::{
 use crate::RealmInfo;
 
 pub mod pin;
+pub mod strong;
 
 const CMD_AUTH_LOGON_CHALLENGE: u8 = 0x00;
 const CMD_AUTH_LOGON_PROOF: u8 = 0x01;
@@ -226,6 +227,18 @@ pub fn write_logon_challenge(
     build: u16,
     locale: u32,
 ) -> std::io::Result<()> {
+    write_logon_challenge_as(w, account_name, build, locale, PROTOCOL_VERSION_THREE)
+}
+
+/// [`write_logon_challenge`] with the protocol byte given: 3 from the client, and
+/// [`strong::PROTOCOL_VERSION`] to ask for the strong handshake.
+pub fn write_logon_challenge_as(
+    w: &mut impl Write,
+    account_name: &str,
+    build: u16,
+    locale: u32,
+    protocol_version: u8,
+) -> std::io::Result<()> {
     // Everything after the 2-byte size field, assembled first so we can prefix its length.
     let mut body = Vec::with_capacity(34 + account_name.len());
     body.extend_from_slice(&GAME_NAME_WOW.to_le_bytes());
@@ -243,7 +256,7 @@ pub fn write_logon_challenge(
 
     let mut packet = Vec::with_capacity(4 + body.len());
     packet.push(CMD_AUTH_LOGON_CHALLENGE);
-    packet.push(PROTOCOL_VERSION_THREE);
+    packet.push(protocol_version);
     packet.extend_from_slice(&(body.len() as u16).to_le_bytes());
     packet.extend_from_slice(&body);
     w.write_all(&packet)
@@ -285,18 +298,7 @@ pub fn read_challenge_reply(r: &mut impl Read) -> Result<Option<ChallengeReply>>
         .map_err(|_| anyhow::anyhow!("large safe prime was {prime_len} bytes, expected 32"))?;
     let salt = read_array::<32>(r)?;
     let crc_salt = read_array::<16>(r)?;
-    // Any non-zero security byte carries the PIN's seed and salt (`0x5bab5a` `test al,al`), as
-    // vmangos sends for an account with a PIN lock (`AuthSocket.cpp:517`).
-    let flags = read_u8(r)?;
-    let pin = if flags != 0 {
-        Some(PinChallenge {
-            flags,
-            grid_seed: read_u32_le(r)?,
-            salt: read_array::<16>(r)?,
-        })
-    } else {
-        None
-    };
+    let pin = read_pin_challenge(r)?;
     Ok(Some(ChallengeReply {
         server_public_key,
         generator,
@@ -305,6 +307,22 @@ pub fn read_challenge_reply(r: &mut impl Read) -> Result<Option<ChallengeReply>>
         crc_salt,
         pin,
     }))
+}
+
+/// The challenge's security byte and what follows it. Any non-zero byte carries the PIN's seed
+/// and salt (`0x5bab5a` `test al,al`), as vmangos sends for an account with a PIN lock
+/// (`AuthSocket.cpp:517`).
+fn read_pin_challenge(r: &mut impl Read) -> Result<Option<PinChallenge>> {
+    let flags = read_u8(r)?;
+    Ok(if flags != 0 {
+        Some(PinChallenge {
+            flags,
+            grid_seed: read_u32_le(r)?,
+            salt: read_array::<16>(r)?,
+        })
+    } else {
+        None
+    })
 }
 
 // --- the version (client-integrity) proof --------------------------------------------------------
@@ -349,7 +367,7 @@ fn integrity_hash(crc_salt: &[u8; 16]) -> Option<[u8; 20]> {
 
 /// The proof's `crc_hash`: `SHA1(A ‖ H)` over `A`'s wire bytes (realmd hashes `lp->A` as
 /// received), or twenty zeros for an unknown salt, which only a strict server refuses.
-pub fn version_proof(crc_salt: &[u8; 16], client_public_key: &[u8; 32]) -> [u8; 20] {
+pub fn version_proof(crc_salt: &[u8; 16], client_public_key: &[u8]) -> [u8; 20] {
     match integrity_hash(crc_salt) {
         Some(h) => {
             let mut sha = Sha1::new();
@@ -377,6 +395,13 @@ pub fn write_logon_proof(
     packet.extend_from_slice(client_proof);
     packet.extend_from_slice(&version_proof(crc_salt, client_public_key));
     packet.push(0); // number_of_telemetry_keys
+    write_pin_proof(&mut packet, pin);
+    w.write_all(&packet)
+}
+
+/// The proof's security byte: the challenge's, 0 with no PIN, and a PIN's salt and hash after it
+/// (`0x5bbc80`-`0x5bbcad`).
+fn write_pin_proof(packet: &mut Vec<u8>, pin: Option<&PinProof>) {
     match pin {
         Some(pin) => {
             packet.push(pin.flags);
@@ -385,7 +410,6 @@ pub fn write_logon_proof(
         }
         None => packet.push(0),
     }
-    w.write_all(&packet)
 }
 
 /// Read the proof reply: the server's `M2`, `None` for [`SUCCESS_SURVEY`] (a success with no `M2`

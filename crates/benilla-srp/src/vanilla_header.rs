@@ -1,6 +1,6 @@
 //! The 1.12 world-packet header obfuscation. After `CMSG_AUTH_SESSION` every header, not the body,
-//! runs through a byte cipher keyed by the 40-byte session key, `i` cycling over the key and
-//! `last_c` the previous ciphertext byte, both starting at 0:
+//! runs through a byte cipher keyed by the session key (40 bytes from the stock logon), `i` cycling
+//! over the key and `last_c` the previous ciphertext byte, both starting at 0:
 //!
 //! ```text
 //! encrypt: c = (p ^ key[i]) + last_c ;  decrypt: p = (c - last_c) ^ key[i]
@@ -15,12 +15,12 @@
 use rand::{thread_rng, RngCore};
 use sha1::{Digest, Sha1};
 
-use crate::{NormalizedString, SESSION_KEY_LENGTH};
+use crate::{NormalizedString, SessionKey};
 
 /// `world_server_proof = SHA1( user | 0u32 | client_seed | server_seed | K )`.
 fn world_server_proof(
     username: &NormalizedString,
-    session_key: &[u8; SESSION_KEY_LENGTH],
+    session_key: &SessionKey,
     server_seed: u32,
     client_seed: u32,
 ) -> [u8; 20] {
@@ -29,15 +29,15 @@ fn world_server_proof(
     h.update(0u32.to_le_bytes());
     h.update(client_seed.to_le_bytes());
     h.update(server_seed.to_le_bytes());
-    h.update(session_key);
+    h.update(session_key.as_bytes());
     h.finalize().into()
 }
 
 /// The header cipher's encrypting half, for the write side of a split connection.
 #[derive(Debug, Clone)]
 pub struct EncrypterHalf {
-    session_key: [u8; SESSION_KEY_LENGTH],
-    index: u8,
+    session_key: SessionKey,
+    index: usize,
     previous: u8,
 }
 
@@ -46,8 +46,8 @@ impl EncrypterHalf {
     pub fn encrypt(&mut self, data: &mut [u8]) {
         for byte in data {
             let encrypted =
-                (*byte ^ self.session_key[self.index as usize]).wrapping_add(self.previous);
-            self.index = (self.index + 1) % SESSION_KEY_LENGTH as u8;
+                (*byte ^ self.session_key.as_bytes()[self.index]).wrapping_add(self.previous);
+            self.index = (self.index + 1) % self.session_key.as_bytes().len();
             *byte = encrypted;
             self.previous = encrypted;
         }
@@ -57,8 +57,8 @@ impl EncrypterHalf {
 /// The header cipher's decrypting half, for the read side of a split connection.
 #[derive(Debug, Clone)]
 pub struct DecrypterHalf {
-    session_key: [u8; SESSION_KEY_LENGTH],
-    index: u8,
+    session_key: SessionKey,
+    index: usize,
     previous: u8,
 }
 
@@ -68,8 +68,8 @@ impl DecrypterHalf {
         for byte in data {
             let encrypted = *byte;
             let decrypted =
-                encrypted.wrapping_sub(self.previous) ^ self.session_key[self.index as usize];
-            self.index = (self.index + 1) % SESSION_KEY_LENGTH as u8;
+                encrypted.wrapping_sub(self.previous) ^ self.session_key.as_bytes()[self.index];
+            self.index = (self.index + 1) % self.session_key.as_bytes().len();
             self.previous = encrypted;
             *byte = decrypted;
         }
@@ -104,14 +104,14 @@ impl HeaderCrypto {
 
     /// The cipher from a session key alone, skipping the proof: a server's [`EncrypterHalf`] is
     /// what a client's [`DecrypterHalf`] inverts, so a fake world server speaks real headers.
-    pub fn from_session_key(session_key: [u8; SESSION_KEY_LENGTH]) -> Self {
-        Self::new(session_key)
+    pub fn from_session_key(session_key: impl Into<SessionKey>) -> Self {
+        Self::new(session_key.into())
     }
 
-    fn new(session_key: [u8; SESSION_KEY_LENGTH]) -> Self {
+    fn new(session_key: SessionKey) -> Self {
         Self {
             encrypt: EncrypterHalf {
-                session_key,
+                session_key: session_key.clone(),
                 index: 0,
                 previous: 0,
             },
@@ -147,9 +147,10 @@ impl ProofSeed {
     pub fn into_client_header_crypto(
         self,
         username: &NormalizedString,
-        session_key: [u8; SESSION_KEY_LENGTH],
+        session_key: impl Into<SessionKey>,
         server_seed: u32,
     ) -> ([u8; 20], HeaderCrypto) {
+        let session_key = session_key.into();
         let proof = world_server_proof(username, &session_key, server_seed, self.seed);
         (proof, HeaderCrypto::new(session_key))
     }

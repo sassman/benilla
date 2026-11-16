@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use benilla_srp::vanilla_header::{HeaderCrypto, ProofSeed};
-use benilla_srp::{NormalizedString, SESSION_KEY_LENGTH};
+use benilla_srp::{NormalizedString, SessionKey};
 
 use crate::messages::{self, opcode, Character, MoveMode, ServerPacket};
 
@@ -96,7 +96,7 @@ impl WorldSession {
     pub fn connect(
         address: &str,
         username: &str,
-        session_key: [u8; SESSION_KEY_LENGTH],
+        session_key: impl Into<SessionKey>,
     ) -> Result<Self> {
         Self::connect_queued(address, username, session_key, &mut |_| true)
     }
@@ -108,7 +108,7 @@ impl WorldSession {
     pub fn connect_queued(
         address: &str,
         username: &str,
-        session_key: [u8; SESSION_KEY_LENGTH],
+        session_key: impl Into<SessionKey>,
         on_event: &mut dyn FnMut(WorldConnectEvent) -> bool,
     ) -> Result<Self> {
         let mut queued = false;

@@ -16,22 +16,31 @@ struct Cli {
     /// Auth (realmd) server host.
     #[arg(default_value = "localhost")]
     host: String,
+    /// Speak the strong handshake (4096-bit group, SHA-512), which no 1.12.1 realmd knows.
+    #[arg(long)]
+    strong: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let logon = benilla_protocol::logon(
+    let handshake = if cli.strong {
+        benilla_protocol::Handshake::Strong
+    } else {
+        benilla_protocol::Handshake::Stock
+    };
+    let logon = benilla_protocol::logon_as(
         &cli.host,
         &cli.username,
         &cli.password,
         benilla_protocol::auth::LOCALE_TAG_EN_US,
+        handshake,
     )?;
 
     println!(
         "authenticated as '{}' (session key {} bytes)",
         cli.username,
-        logon.session_key.len()
+        logon.session_key.as_bytes().len()
     );
     if logon.realms.is_empty() {
         println!("no realms advertised");

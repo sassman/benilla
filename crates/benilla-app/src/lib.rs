@@ -72,6 +72,7 @@ mod items;
 mod lanes;
 mod loading_screen;
 mod local_state;
+mod logon_handshake;
 mod minimap;
 mod nameplates;
 mod names;

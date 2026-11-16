@@ -23,7 +23,8 @@ fn main() {
 
     let username = NormalizedString::new(user).expect("invalid username");
     let password = NormalizedString::new(pass).expect("invalid password");
-    let (salt, verifier) = benilla_srp::generate_account(&username, &password);
+    let (salt, verifier) =
+        benilla_srp::generate_account(&username, &password).expect("invalid username");
 
     println!(
         "INSERT INTO account (username, v, s, gmlevel, expansion) VALUES ('{}', '{}', '{}', 3, 0);",

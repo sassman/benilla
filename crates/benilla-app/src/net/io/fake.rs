@@ -229,7 +229,7 @@ fn serve_realmd(
     let g = BigUint::from(GENERATOR);
     let user = NormalizedString::new(USER).unwrap();
     let pass = NormalizedString::new(PASS).unwrap();
-    let v = BigUint::from_bytes_le(&password_verifier(&user, &pass, &SALT));
+    let v = BigUint::from_bytes_le(&password_verifier(&user, &pass, &SALT).unwrap());
 
     // CMD_AUTH_LOGON_CHALLENGE_Client: opcode, protocol, u16 size, then the body.
     let mut head = [0u8; 4];
@@ -984,6 +984,7 @@ pub(crate) fn login(cycles: &Cycles, host: &str) {
             pass: PASS.into(),
             host: host.into(),
             locale: benilla_protocol::auth::LOCALE_TAG_EN_US,
+            handshake: benilla_protocol::Handshake::Stock,
             generation: cycles.abandon.load(Ordering::SeqCst),
         })
         .unwrap();

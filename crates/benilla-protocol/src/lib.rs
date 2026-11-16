@@ -7,6 +7,7 @@ pub mod guid;
 pub mod messages;
 pub mod wire;
 pub mod world;
+pub use auth::strong::StrongUnsupported;
 pub use auth::{AuthReject, LogonReply};
 pub use events::{
     decode, CharAction, EntityKind, LoginRefusal, LoginStage, MoveSpeeds, NotifyBlock, Poll,
@@ -27,7 +28,10 @@ pub use world::{
 use std::net::{SocketAddr, TcpStream};
 
 use anyhow::{anyhow, Context, Result};
-use benilla_srp::{NormalizedString, PublicKey, SrpClientChallenge, SESSION_KEY_LENGTH};
+use benilla_srp::strong::StrongClientChallenge;
+use benilla_srp::{
+    NormalizedString, PublicKey, SessionKey, SrpClientChallenge, SESSION_KEY_LENGTH,
+};
 
 /// The port a stock vmangos `realmd` listens on.
 pub const AUTH_PORT: u16 = 3724;
@@ -249,7 +253,7 @@ pub struct RealmInfo {
 /// A successful logon: the SRP6 session key, the realms, and the realmd socket, kept open because
 /// the reference's `RealmList.lua` re-requests the list every `REALM_LIST_REFRESH_TIME` (5 s).
 pub struct Logon {
-    pub session_key: [u8; SESSION_KEY_LENGTH],
+    pub session_key: SessionKey,
     pub realms: Vec<RealmInfo>,
     /// The last reply was one the record fill refused ([`auth::RealmListRefused`]): `realms` is
     /// empty and the link still up.
@@ -327,11 +331,37 @@ impl Logon {
 /// `locale` is the client's locale tag the challenge carries ([`auth::write_logon_challenge`]).
 /// An account that asks for a PIN fails it: [`logon_with_pin`] is the logon that can answer.
 pub fn logon(realmlist: &str, username: &str, password: &str, locale: u32) -> Result<Logon> {
-    logon_with_pin(
+    logon_as(realmlist, username, password, locale, Handshake::Stock)
+}
+
+/// Which SRP6 handshake a logon speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Handshake {
+    /// The 1.12.1 client's, which every realmd speaks.
+    #[default]
+    Stock,
+    /// Deviation: a 4096-bit group with SHA-512 ([`auth::strong`]), which no 1.12.1 realmd
+    /// speaks, offered because the stock handshake no longer keeps a password from whoever
+    /// records the exchange. A server that does not know it ends the logon with
+    /// [`StrongUnsupported`]: there is no falling back to the stock one, or whoever sits
+    /// between the two could force it.
+    Strong,
+}
+
+/// [`logon`], speaking `handshake`.
+pub fn logon_as(
+    realmlist: &str,
+    username: &str,
+    password: &str,
+    locale: u32,
+    handshake: Handshake,
+) -> Result<Logon> {
+    logon_with_pin_as(
         realmlist,
         username,
         password,
         locale,
+        handshake,
         &mut |_| {
             Err(anyhow!(
                 "the account asks for a PIN, which this logon cannot enter"
@@ -360,12 +390,47 @@ pub fn logon_with_pin(
     pin: &mut dyn FnMut(&[u8; 10]) -> Result<Vec<u8>>,
     stage: &mut dyn FnMut(LoginStage),
 ) -> Result<Logon> {
+    logon_with_pin_as(
+        realmlist,
+        username,
+        password,
+        locale,
+        Handshake::Stock,
+        pin,
+        stage,
+    )
+}
+
+/// [`logon_with_pin`], speaking `handshake`.
+pub fn logon_with_pin_as(
+    realmlist: &str,
+    username: &str,
+    password: &str,
+    locale: u32,
+    handshake: Handshake,
+    pin: &mut dyn FnMut(&[u8; 10]) -> Result<Vec<u8>>,
+    stage: &mut dyn FnMut(LoginStage),
+) -> Result<Logon> {
     let username_n =
         NormalizedString::new(username).map_err(|e| anyhow!("invalid username: {e}"))?;
-    let password_n =
-        NormalizedString::new(password).map_err(|e| anyhow!("invalid password: {e}"))?;
     // One draw per login, as the reference dials once: the redials below go to the same address.
     let (target, address) = logon_target(realmlist)?;
+
+    // The strong handshake hashes the password as typed, so it is not put through the stock
+    // client's normalising: that would fold its case and refuse one longer than 16 bytes.
+    if handshake == Handshake::Strong {
+        return strong_logon(
+            target,
+            &address,
+            username,
+            &username_n,
+            password,
+            locale,
+            stage,
+        );
+    }
+    let password_n =
+        NormalizedString::new(password).map_err(|e| anyhow!("invalid password: {e}"))?;
 
     // The account name goes uppercased, as SRP6 hashes it. About one `B` in 137 serializes
     // differently in the client and mangos (a right password gets 0x04), so redial for a fresh
@@ -389,7 +454,7 @@ pub fn logon_with_pin(
             else {
                 // `SUCCESS_SURVEY` on the challenge authenticates with no SRP exchange; the
                 // reference's success arm copies no key (length 0 at `0x5b2e16`).
-                return finish_logon(stream, [0u8; SESSION_KEY_LENGTH], None, false);
+                return finish_logon(stream, [0u8; SESSION_KEY_LENGTH].into(), None, false);
             };
             let server_public_key = PublicKey::from_le_bytes(reply.server_public_key)
                 .map_err(|e| anyhow!("invalid server public key: {e}"))?;
@@ -410,24 +475,10 @@ pub fn logon_with_pin(
         reply.large_safe_prime,
         server_public_key,
         reply.salt,
-    );
+    )
+    .context("computing the logon proof")?;
 
-    // The keypad waits for the player (logon state 7, `0x5b1cd7`); the proof goes once the keys
-    // are in (`0x5b3120` reports state 9, whose arm sends it, `0x46bb2f`).
-    let (pin_proof, pin_digits) = match &reply.pin {
-        Some(challenge) => {
-            let grid = auth::pin::grid(challenge.grid_seed);
-            let positions = pin(&grid).context("entering the PIN")?;
-            (
-                Some(auth::PinProof::new(challenge, &positions)),
-                auth::pin::digits(&grid, &positions),
-            )
-        }
-        None => {
-            stage(LoginStage::CheckingVersions);
-            (None, None)
-        }
-    };
+    let (pin_proof, pin_digits) = answer_pin(reply.pin.as_ref(), pin, stage)?;
     auth::write_logon_proof(
         &mut stream,
         challenge.client_public_key(),
@@ -448,13 +499,98 @@ pub fn logon_with_pin(
             // this exchange derived.
             None => challenge.into_unverified_session_key(),
         };
-    finish_logon(stream, session_key, pin_digits, reply.pin.is_some())
+    finish_logon(stream, session_key.into(), pin_digits, reply.pin.is_some())
+}
+
+/// The challenge's PIN, answered: the proof's PIN fields and the digits the keys pressed showed,
+/// or neither for an account that asks for none. The keypad waits for the player (logon state 7,
+/// `0x5b1cd7`); the proof goes once the keys are in (`0x5b3120` reports state 9, whose arm sends
+/// it, `0x46bb2f`).
+fn answer_pin(
+    challenge: Option<&auth::PinChallenge>,
+    pin: &mut dyn FnMut(&[u8; 10]) -> Result<Vec<u8>>,
+    stage: &mut dyn FnMut(LoginStage),
+) -> Result<(Option<auth::PinProof>, Option<Vec<u8>>)> {
+    Ok(match challenge {
+        Some(challenge) => {
+            let grid = auth::pin::grid(challenge.grid_seed);
+            let positions = pin(&grid).context("entering the PIN")?;
+            (
+                Some(auth::PinProof::new(challenge, &positions)),
+                auth::pin::digits(&grid, &positions),
+            )
+        }
+        None => {
+            stage(LoginStage::CheckingVersions);
+            (None, None)
+        }
+    })
+}
+
+/// The strong logon ([`Handshake::Strong`]): one dial, since its values have one encoding and
+/// no server key needs a fresh draw, and no key before the server has proved itself.
+///
+/// An account that asks for a PIN is refused: the PIN's proof travels with `M1`, before the
+/// server has proved anything, and its hash of a few digits under a salt the server chose is
+/// searched in no time by whoever answered the challenge.
+fn strong_logon(
+    target: SocketAddr,
+    address: &str,
+    username: &str,
+    username_n: &NormalizedString,
+    password: &str,
+    locale: u32,
+    stage: &mut dyn FnMut(LoginStage),
+) -> Result<Logon> {
+    let mut stream = connect(target, address)?;
+    stage(LoginStage::Authenticating);
+    auth::write_logon_challenge_as(
+        &mut stream,
+        &username.to_uppercase(),
+        CLIENT_BUILD,
+        locale,
+        auth::strong::PROTOCOL_VERSION,
+    )
+    .context("sending strong logon challenge")?;
+    let reply = auth::strong::read_challenge_reply(&mut stream)
+        .context("reading strong logon challenge reply")?;
+    if reply.pin.is_some() {
+        return Err(anyhow!(
+            "the strong logon answers no PIN: it would go out before the server proved itself"
+        ));
+    }
+
+    let challenge = StrongClientChallenge::new(
+        username_n,
+        password,
+        &reply.generator,
+        &reply.modulus,
+        &reply.server_public_key,
+        &reply.salt,
+    )
+    .context("computing the strong logon proof")?;
+
+    auth::strong::write_logon_proof(
+        &mut stream,
+        challenge.client_public_key(),
+        challenge.client_proof(),
+        &reply.crc_salt,
+    )
+    .context("sending strong logon proof")?;
+    stage(LoginStage::ProofSent);
+
+    let server_proof =
+        auth::strong::read_proof_reply(&mut stream).context("reading strong logon proof reply")?;
+    let session_key = challenge
+        .verify_server_proof(&server_proof)
+        .map_err(|e| anyhow!("server proof mismatch (wrong password?): {e}"))?;
+    finish_logon(stream, session_key, None, false)
 }
 
 /// An authenticated logon's tail: the realm list over the same socket.
 fn finish_logon(
     mut stream: TcpStream,
-    session_key: [u8; SESSION_KEY_LENGTH],
+    session_key: SessionKey,
     pin: Option<Vec<u8>>,
     pin_asked: bool,
 ) -> Result<Logon> {

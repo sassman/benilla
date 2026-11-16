@@ -196,6 +196,15 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "that host has not resolved since 2019, so shipping it makes every first launch a \
          DNS failure; benilla dials the machine it is running on",
     ),
+    // benilla's own, not a 1.12 CVar: which SRP6 handshake a logon speaks, judged by
+    // `logon_handshake::check`. The module gives the deviation.
+    ours(
+        crate::logon_handshake::CVAR_LOGON_HANDSHAKE,
+        crate::logon_handshake::DEFAULT_LOGON_HANDSHAKE,
+        "benilla's own — the reference has one logon handshake and no setting for it; \
+         `strong` asks a server that knows it for a 4096-bit group and SHA-512",
+    )
+    .checked(crate::logon_handshake::check),
     // `autoClearAFK` (`0x5e24d4`, "1" `0x82e748`, handle `[0xc4d68c]` set at `0x5e24ef`, read at
     // `0x5eb84b`) gates five implicit AFK clears: any chat send but type `0x14`, Jump,
     // forward/back, strafe and turn (`0x513d36`/`0x514e23`/`0x514f0b`/`0x514fca`). Off, the clear

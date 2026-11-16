@@ -77,6 +77,9 @@ pub(crate) struct LoginRequest {
     pub(crate) host: String,
     /// The locale tag the logon challenge carries ([`crate::ui_script::client_locale`]).
     pub(crate) locale: u32,
+    /// The SRP6 handshake the logon speaks ([`crate::logon_handshake`]), per attempt like the
+    /// realmlist.
+    pub(crate) handshake: benilla_protocol::Handshake,
     pub(crate) generation: u64,
 }
 
@@ -438,11 +441,12 @@ fn query(
                 .ok_or_else(|| anyhow!("the re-dial has no PIN to press"))
         };
         // A hidden re-dial for the realm list: no logon on the screen to tell the states to.
-        match benilla_protocol::logon_with_pin(
+        match benilla_protocol::logon_with_pin_as(
             &req.host,
             &req.user,
             &req.pass,
             req.locale,
+            req.handshake,
             &mut press,
             &mut |_| {},
         ) {
@@ -632,11 +636,12 @@ fn run(
         // challenge asks for a PIN.
         stage(LoginStage::Connecting);
         let mut superseded = None;
-        let logon = benilla_protocol::logon_with_pin(
+        let logon = benilla_protocol::logon_with_pin_as(
             &req.host,
             &req.user,
             &req.pass,
             req.locale,
+            req.handshake,
             &mut |grid| {
                 let prompt = PIN_PROMPTS.fetch_add(1, Ordering::SeqCst) + 1;
                 stage(LoginStage::Pin {
@@ -810,7 +815,7 @@ fn world(
         let mut session = match WorldSession::connect_queued(
             &world_addr,
             &req.user,
-            logon.session_key,
+            &logon.session_key,
             &mut on_queue,
         ) {
             Ok(s) => s,

@@ -41,7 +41,7 @@ fn main() {
         Some("check") if args.len() == 5 => {
             let user = NormalizedString::new(&args[1]).expect("username");
             let pass = NormalizedString::new(&args[2]).expect("password");
-            let v = password_verifier(&user, &pass, &le_from_hex(&args[3]));
+            let v = password_verifier(&user, &pass, &le_from_hex(&args[3])).expect("verifier");
             let got = hex_from_le(&v);
             let want = format!("{:0>64}", args[4].trim().to_uppercase());
             if got == want {
@@ -58,7 +58,7 @@ fn main() {
             let pass_s = format!("pprobe{n}");
             let user = NormalizedString::new(&user_s).expect("username");
             let pass = NormalizedString::new(&pass_s).expect("password");
-            let (salt, verifier) = generate_account(&user, &pass);
+            let (salt, verifier) = generate_account(&user, &pass).expect("account");
             println!(
                 "INSERT INTO account (username, gmlevel, v, s) VALUES ('{}', 3, '{}', '{}');",
                 user_s.to_uppercase(),

@@ -2,23 +2,33 @@
 //! handshake and the world server's header obfuscation. Every byte array is little endian, as on
 //! the wire.
 //!
+//! The SRP6 arithmetic is the `srp6` crate's, in its 1.12.1 flavour: `k = 3`, SHA-1, the 256-bit
+//! group, little endian. This crate is the client around it: the name and password as the client
+//! normalises them, the checks on the server's key, and the redraw below.
+//!
 //! # Encoding-unambiguous handshakes
 //!
 //! The 1.12.1 client hashes `A`, `B`, `K`, the salt and `M1` at their declared widths, zero-padded
 //! (`0x5d3650`); vmangos (`SHA1::Generator::UpdateData(BigNumber const&)`) and cmangos
 //! (`Sha1Hash::UpdateBigNumbers`) drop high-order zero bytes, so a value with one hashes
 //! differently and realmd answers `WOW_FAIL_UNKNOWN_ACCOUNT` (0x04) to a correct password. The low
-//! end of `S` has the same split ([`calculate_interleaved`]).
+//! end of `S` has the same split: before the interleave the client strips its zero low bytes
+//! (`0x5d3360`), where vmangos hashes all 32 (`SRP6::HashSessionKey`, `S.AsByteArray(32)`).
 //!
 //! Deviation: [`SrpClientChallenge::new`] redraws `a` until every value it sends serializes the
-//! same both ways ([`is_width_stable`]), and `benilla-protocol`'s `logon` redials when the server's
-//! `B` lands ambiguous, because a client that picks either serialization fails about 1 handshake
-//! in 45 against vmangos. The arithmetic stays the client's; only an ambiguous draw is declined.
+//! same both ways, and `benilla-protocol`'s `logon` redials when the server's `B` lands ambiguous
+//! ([`PublicKey::is_width_stable`]), because a client that picks either serialization fails about
+//! 1 handshake in 45 against vmangos. The arithmetic stays the client's; only an ambiguous draw is
+//! declined.
 
-use num_bigint::BigInt;
 use rand::{thread_rng, RngCore};
-use sha1::{Digest, Sha1};
+use srp6::wow::Srp6_256;
+use srp6::{
+    ClientEphemeral, ClientProof, GroupWow, Handshake, Salt, Srp6Error, StrongProofVerifier,
+    Username,
+};
 
+pub mod strong;
 pub mod vanilla_header;
 
 pub use vanilla_header::{DecrypterHalf, EncrypterHalf, HeaderCrypto, ProofSeed};
@@ -37,36 +47,81 @@ pub const LARGE_SAFE_PRIME_LITTLE_ENDIAN: [u8; 32] = [
     0xb7, 0x9b, 0x3e, 0x2a, 0x87, 0x82, 0x3c, 0xab, 0x8f, 0x5e, 0xbf, 0xbf, 0x8e, 0xb1, 0x1, 0x8,
     0x53, 0x50, 0x6, 0x29, 0x8b, 0x5b, 0xad, 0xbd, 0x5b, 0x53, 0xe1, 0x89, 0x5e, 0x64, 0x4b, 0x89,
 ];
-/// The SRP multiplier `k`, fixed at 3 (SRP6, not 6a).
-const K_VALUE: u8 = 3;
 
-// --- bigint helpers (little-endian, unsigned magnitude) ------------------------------------------
+/// The hash of the 1.12.1 flavour, as `srp6` names it.
+type Sha1 = srp6::Sha1;
 
-fn from_le(bytes: &[u8]) -> BigInt {
-    BigInt::from_bytes_le(num_bigint::Sign::Plus, bytes)
-}
+/// The session key `K` a logon derived: 40 bytes from the stock handshake, 128 from the strong
+/// one ([`strong`]). The world handshake and the header cipher run over its bytes at either
+/// width, so past the logon nothing asks which it was.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionKey(Box<[u8]>);
 
-/// Magnitude of `v` as a zero-padded 32-byte little-endian array (`v` is always `< N < 2^256`).
-fn to_padded_32_le(v: &BigInt) -> [u8; 32] {
-    let (_, bytes) = v.to_bytes_le();
-    let mut out = [0u8; 32];
-    out[..bytes.len()].copy_from_slice(&bytes);
-    out
-}
-
-fn sha1(parts: &[&[u8]]) -> [u8; 20] {
-    let mut h = Sha1::new();
-    for p in parts {
-        h.update(p);
+impl SessionKey {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
     }
-    h.finalize().into()
 }
 
-/// Whether a little-endian value hashes the same at its declared width and at minimal length:
-/// exactly when its high-order byte is non-zero.
-fn is_width_stable(little_endian: &[u8]) -> bool {
-    matches!(little_endian.last(), Some(&b) if b != 0)
+impl From<[u8; SESSION_KEY_LENGTH]> for SessionKey {
+    fn from(key: [u8; SESSION_KEY_LENGTH]) -> Self {
+        Self(key.into())
+    }
 }
+
+impl From<[u8; strong::SESSION_KEY_LENGTH]> for SessionKey {
+    fn from(key: [u8; strong::SESSION_KEY_LENGTH]) -> Self {
+        Self(key.into())
+    }
+}
+
+impl From<&SessionKey> for SessionKey {
+    fn from(key: &SessionKey) -> Self {
+        key.clone()
+    }
+}
+
+// The key authenticates the account to any world server on its list, so it stays out of logs.
+impl std::fmt::Debug for SessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SessionKey(<{} bytes>)", self.0.len())
+    }
+}
+
+// --- errors --------------------------------------------------------------------------------------
+
+/// Why the SRP6 core declined an input.
+#[derive(Debug)]
+pub enum SrpError {
+    /// The server's `g` or `N` is not 1.12.1's. Deviation: another group is refused where the
+    /// client computes in whichever the server names, because the SRP core holds only the group
+    /// every 1.12.1 realmd sends.
+    UnknownGroup,
+    /// The account name carries a `:`. Deviation: it is refused where the client's normalising
+    /// lets it through, because `x` hashes `name ":" password` and a colon in the name makes two
+    /// accounts share one hash input.
+    InvalidUsername,
+    /// The server's values make the exchange degenerate: a `B` that forces the premaster secret
+    /// or the scrambler to zero. Deviation: the logon ends where the client computes on,
+    /// because a secret the server can force is one it need not know the verifier for.
+    Rejected(Srp6Error),
+    /// No draw of `a` encoded unambiguously within the cap on draws. Deviation: the logon ends
+    /// where the client sends its last draw whatever it is, because that draw is the one realmd
+    /// hashes differently, and its failed proof reads as a wrong password.
+    NoUnambiguousDraw,
+}
+
+impl std::fmt::Display for SrpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownGroup => write!(f, "the server's g and N are not the 1.12.1 group"),
+            Self::InvalidUsername => write!(f, "the account name must not contain a colon"),
+            Self::Rejected(e) => write!(f, "the server's SRP values are degenerate: {e}"),
+            Self::NoUnambiguousDraw => write!(f, "no ephemeral key encoded unambiguously"),
+        }
+    }
+}
+impl std::error::Error for SrpError {}
 
 // --- normalized string ---------------------------------------------------------------------------
 
@@ -117,6 +172,11 @@ impl AsRef<str> for NormalizedString {
     fn as_ref(&self) -> &str {
         &self.s
     }
+}
+
+/// The account name as the SRP core takes it.
+pub(crate) fn srp_username(username: &NormalizedString) -> Result<Username, SrpError> {
+    Username::new(username.as_ref()).map_err(|_| SrpError::InvalidUsername)
 }
 
 // --- public key ----------------------------------------------------------------------------------
@@ -172,96 +232,22 @@ impl PublicKey {
     pub const fn is_width_stable(&self) -> bool {
         self.key[31] != 0
     }
-
-    fn as_bigint(&self) -> BigInt {
-        from_le(&self.key)
-    }
 }
 
 // --- SRP6 client ---------------------------------------------------------------------------------
 
-/// `SHA1(N) XOR SHA1(g)`, the head of `M1`, from the `g` and `N` the server sent.
-fn xor_hash(generator: u8, large_safe_prime: &[u8; 32]) -> [u8; 20] {
-    let n_hash = sha1(&[large_safe_prime]);
-    let g_hash = sha1(&[&[generator]]);
-    let mut out = [0u8; 20];
-    for (o, (n, g)) in out.iter_mut().zip(n_hash.iter().zip(g_hash.iter())) {
-        *o = n ^ g;
-    }
-    out
-}
-
-/// `x = SHA1( salt | SHA1( UPPER(user) ":" UPPER(pass) ) )`.
-fn calculate_x(
-    username: &NormalizedString,
-    password: &NormalizedString,
-    salt: &[u8; 32],
-) -> [u8; 20] {
-    let inner = sha1(&[
-        username.as_ref().as_bytes(),
-        b":",
-        password.as_ref().as_bytes(),
-    ]);
-    sha1(&[salt, &inner])
-}
-
-/// `u = SHA1( A | B )` (both little endian).
-fn calculate_u(client_public_key: &PublicKey, server_public_key: &PublicKey) -> [u8; 20] {
-    sha1(&[
-        client_public_key.as_le_bytes(),
-        server_public_key.as_le_bytes(),
-    ])
-}
-
-/// Fold `S` (32 LE bytes) into the 40-byte session key: SHA-1 the even and the odd bytes apart and
-/// interleave the two digests (WoW's `SHA1_Interleave`).
-///
-/// The client strips leading zero bytes first, the low bytes of a little-endian `S` (`0x5d3360`);
-/// vmangos hashes all 32 (`SRP6::HashSessionKey`, `S.AsByteArray(32)`). This hashes all 32, and
-/// [`SrpClientChallenge::new`] never keeps an `S` with a zero low byte, so this `K` is both.
-fn calculate_interleaved(s: &[u8; 32]) -> [u8; 40] {
-    let mut e = [0u8; 16];
-    for (i, b) in s.iter().step_by(2).enumerate() {
-        e[i] = *b;
-    }
-    let g = sha1(&[&e]);
-
-    let mut f = [0u8; 16];
-    for (i, b) in s.iter().skip(1).step_by(2).enumerate() {
-        f[i] = *b;
-    }
-    let h = sha1(&[&f]);
-
-    let mut out = [0u8; 40];
-    for (i, (gi, hi)) in g.iter().zip(h.iter()).enumerate() {
-        out[i * 2] = *gi;
-        out[i * 2 + 1] = *hi;
-    }
-    out
-}
-
-/// `M2 = SHA1( A | M1 | K )`, the server's proof back.
-fn calculate_server_proof(
-    client_public_key: &PublicKey,
-    client_proof: &[u8; 20],
-    session_key: &[u8; 40],
-) -> [u8; 20] {
-    sha1(&[client_public_key.as_le_bytes(), client_proof, session_key])
-}
-
 /// The client's side of the logon proof: `A` and `M1` go in `CMD_AUTH_LOGON_PROOF_Client`, and the
 /// server's `M2` is checked with [`SrpClientChallenge::verify_server_proof`].
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SrpClientChallenge {
     username: NormalizedString,
     client_proof: [u8; 20],
     client_public_key: [u8; 32],
-    session_key: [u8; 40],
+    verifier: StrongProofVerifier<GroupWow, Sha1>,
 }
 
-/// The cap on ephemerals [`SrpClientChallenge::new`] draws, so a hostile `N`/`g` cannot spin it
-/// forever. Each passes about 97.4% of the time; the last is sent regardless, which can fail the
-/// logon but never corrupt it.
+/// The cap on ephemerals [`SrpClientChallenge::new`] draws, so the redraw is bounded. Each passes
+/// about 97.4% of the time; running out ends the logon with [`SrpError::NoUnambiguousDraw`].
 const MAX_EPHEMERAL_DRAWS: u32 = 512;
 
 impl SrpClientChallenge {
@@ -277,7 +263,7 @@ impl SrpClientChallenge {
         large_safe_prime: [u8; 32],
         server_public_key: PublicKey,
         salt: [u8; 32],
-    ) -> SrpClientChallenge {
+    ) -> Result<SrpClientChallenge, SrpError> {
         Self::new_with_rng(
             &mut thread_rng(),
             username,
@@ -298,65 +284,41 @@ impl SrpClientChallenge {
         large_safe_prime: [u8; 32],
         server_public_key: PublicKey,
         salt: [u8; 32],
-    ) -> SrpClientChallenge {
-        let n = from_le(&large_safe_prime);
-        let g = BigInt::from(generator);
-        let k = BigInt::from(K_VALUE);
+    ) -> Result<SrpClientChallenge, SrpError> {
+        let srp = Srp6_256::default();
+        srp.check_group(&large_safe_prime, &[generator])
+            .map_err(|_| SrpError::UnknownGroup)?;
 
-        let x = from_le(&calculate_x(&username, &password, &salt));
-        let s_base = server_public_key.as_bigint() - &k * g.modpow(&x, &n);
-        let xor = xor_hash(generator, &large_safe_prime);
-        let username_hash = sha1(&[username.as_ref().as_bytes()]);
+        let user = srp_username(&username)?;
+        let handshake = Handshake::from_wire(
+            srp6::PublicKey::<GroupWow>::try_from_bytes(server_public_key.as_le_bytes())
+                .map_err(SrpError::Rejected)?,
+            Salt::from(salt.to_vec()),
+        );
 
-        for draw in 1..=MAX_EPHEMERAL_DRAWS {
-            let last = draw == MAX_EPHEMERAL_DRAWS;
-
+        for _ in 0..MAX_EPHEMERAL_DRAWS {
             let mut private_key = [0u8; 32];
             rng.fill_bytes(&mut private_key);
-            let a = from_le(&private_key);
-
-            let client_public_key = to_padded_32_le(&g.modpow(&a, &n));
-            if !is_width_stable(&client_public_key) && !last {
+            // An all-zero draw is no ephemeral at all; it is redrawn like an ambiguous one.
+            let Ok(a) = ClientEphemeral::try_from_bytes(&private_key) else {
                 continue;
-            }
-
-            let client_pk = PublicKey::from_le_bytes(client_public_key)
-                .expect("generated client public key is valid");
-            let u = from_le(&calculate_u(&client_pk, &server_public_key));
-
-            // S = (B - k·(g^x mod N))^(a + u·x) mod N
-            let s = to_padded_32_le(&s_base.modpow(&(&a + &u * &x), &n));
-            // The client's interleave strips a zero low byte: decline it, so `K` is both sides'.
-            if s[0] == 0 && !last {
-                continue;
-            }
-
-            let session_key = calculate_interleaved(&s);
-            if !is_width_stable(&session_key) && !last {
-                continue;
-            }
-
-            let client_proof = sha1(&[
-                &xor,
-                &username_hash,
-                &salt,
-                &client_public_key,
-                server_public_key.as_le_bytes(),
-                &session_key,
-            ]);
-            // M1 feeds the server's M2: an ambiguous one passes realmd but fails our M2 check.
-            if !is_width_stable(&client_proof) && !last {
-                continue;
-            }
-
-            return SrpClientChallenge {
-                username,
-                client_proof,
-                client_public_key,
-                session_key,
             };
+
+            match srp.calculate_proof_with_a(&handshake, &user, password.as_ref(), &a) {
+                Ok(ClientProof { proof, verifier }) => {
+                    return Ok(SrpClientChallenge {
+                        username,
+                        client_proof: proof.proof().as_array(),
+                        client_public_key: proof.public_key().as_array(),
+                        verifier,
+                    });
+                }
+                // The SRP core declines a draw that would hash differently on realmd.
+                Err(Srp6Error::AmbiguousEncoding) => {}
+                Err(e) => return Err(SrpError::Rejected(e)),
+            }
         }
-        unreachable!("the final draw is accepted unconditionally")
+        Err(SrpError::NoUnambiguousDraw)
     }
 
     /// Our proof `M1`, little endian.
@@ -369,42 +331,37 @@ impl SrpClientChallenge {
         &self.client_public_key
     }
 
+    fn session_key(&self) -> [u8; 40] {
+        self.verifier.session_key().as_array()
+    }
+
     /// The session key this exchange derived, for a logon the server accepted without an `M2`
     /// (realmd's `SUCCESS_SURVEY`), which leaves nothing to verify.
     pub fn into_unverified_session_key(self) -> [u8; 40] {
-        self.session_key
+        self.session_key()
     }
 
-    /// Verify the server's proof `M2`; the returned [`SrpClient`] holds the session key.
+    /// Verify the server's proof `M2 = SHA1( A | M1 | K )`; the returned [`SrpClient`] holds the
+    /// session key.
     pub fn verify_server_proof(
         self,
         server_proof: [u8; 20],
     ) -> Result<SrpClient, MatchProofsError> {
-        let expected = calculate_server_proof(
-            &PublicKey::from_le_bytes(self.client_public_key)
-                .expect("our own client public key is valid"),
-            &self.client_proof,
-            &self.session_key,
-        );
-        if server_proof != expected {
-            return Err(MatchProofsError {
-                server_proof,
-                expected,
-            });
+        let m2 = srp6::Proof::<Sha1>::try_from_bytes(&server_proof)
+            .expect("a proof is one SHA-1 digest wide");
+        match Srp6_256::default().verify_strong_proof(&self.verifier, &m2) {
+            Ok(session_key) => Ok(SrpClient {
+                username: self.username,
+                session_key: session_key.as_array(),
+            }),
+            Err(_) => Err(MatchProofsError),
         }
-        Ok(SrpClient {
-            username: self.username,
-            session_key: self.session_key,
-        })
     }
 }
 
 /// The server's proof `M2` did not match what we computed (usually a wrong password).
 #[derive(Debug)]
-pub struct MatchProofsError {
-    pub server_proof: [u8; 20],
-    pub expected: [u8; 20],
-}
+pub struct MatchProofsError;
 impl std::fmt::Display for MatchProofsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "server proof mismatch (wrong password?)")
@@ -434,11 +391,13 @@ pub fn password_verifier(
     username: &NormalizedString,
     password: &NormalizedString,
     salt: &[u8; 32],
-) -> [u8; 32] {
-    let n = from_le(&LARGE_SAFE_PRIME_LITTLE_ENDIAN);
-    let g = BigInt::from(GENERATOR);
-    let x = from_le(&calculate_x(username, password, salt));
-    to_padded_32_le(&g.modpow(&x, &n))
+) -> Result<[u8; 32], SrpError> {
+    let (_, verifier) = Srp6_256::default().generate_new_user_secrets_with_salt(
+        &srp_username(username)?,
+        password.as_ref(),
+        Salt::from(salt.to_vec()),
+    );
+    Ok(verifier.as_array())
 }
 
 /// A fresh random salt and its [`password_verifier`] for a new account, both little endian. The
@@ -447,18 +406,21 @@ pub fn password_verifier(
 pub fn generate_account(
     username: &NormalizedString,
     password: &NormalizedString,
-) -> ([u8; 32], [u8; 32]) {
+) -> Result<([u8; 32], [u8; 32]), SrpError> {
     let mut salt = [0u8; 32];
     thread_rng().fill_bytes(&mut salt);
     salt[31] |= 0x80;
-    let verifier = password_verifier(username, password, &salt);
-    (salt, verifier)
+    let verifier = password_verifier(username, password, &salt)?;
+    Ok((salt, verifier))
 }
 
 #[cfg(test)]
 mod tests {
-    //! The interleave and `x` are pinned to the published WoW SRP6 vectors (the `wow_srp` crate's
-    //! MIT corpus); the header cipher and password verifier to goldens from that implementation.
+    //! The handshake and the password verifier are pinned to known answers; `srp6` pins the
+    //! interleave to the published WoW SRP6 vectors (the `wow_srp` crate's MIT corpus). The header
+    //! cipher is pinned to a golden from that implementation.
+    use sha1::Digest;
+
     use super::*;
 
     fn hx(s: &str) -> Vec<u8> {
@@ -467,87 +429,25 @@ mod tests {
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
     }
-    fn rev(mut v: Vec<u8>) -> Vec<u8> {
-        v.reverse();
-        v
+
+    /// Whether a little-endian value hashes the same at its declared width and at minimal length:
+    /// exactly when its high-order byte is non-zero.
+    fn is_width_stable(little_endian: &[u8]) -> bool {
+        matches!(little_endian.last(), Some(&b) if b != 0)
     }
 
-    #[test]
-    fn interleave_known_answer() {
-        // (S little-endian, expected session key little-endian) from the WoW SRP6 vector corpus.
-        let cases = [
-            (
-                "8F4CEBD60DFC34E5C007E51BD4F3A4FF2BC1D930E2D3EA770D8D3EEDFF2DCCFC",
-                "EE144E1AE08DAC891AB63ABC42BF89738003343422E6B58131BEE4C3087A7027E55A7216D18D556C",
-            ),
-            (
-                "CCC1BDE07FC4FA3182DDEAAB036A88F78AD605AB0D8BFBF6F5EE8ED65CDE4F09",
-                "2AA23706C3FC3517A4293E2D4944F567E220CC1A227359D70154E5FD3CEE973673130C4AFBAD9E6D",
-            ),
-        ];
-        for (s_hex, key_hex) in cases {
-            let s: [u8; 32] = hx(s_hex).try_into().unwrap();
-            assert_eq!(calculate_interleaved(&s).to_vec(), hx(key_hex), "S={s_hex}");
-        }
-    }
-
-    #[test]
-    fn interleave_does_not_trim_low_order_zero_bytes() {
-        let mut s = [0u8; 32];
-        s.copy_from_slice(&hx(
-            "8F4CEBD60DFC34E5C007E51BD4F3A4FF2BC1D930E2D3EA770D8D3EEDFF2DCCFC",
-        ));
-        let mut zeroed = s;
-        zeroed[0] = 0;
-        zeroed[1] = 0;
-
-        // The untrimmed split, built by hand; a trim would re-split the remaining 30 bytes.
-        let mut expect_even = [0u8; 16];
-        let mut expect_odd = [0u8; 16];
-        for i in 0..16 {
-            expect_even[i] = zeroed[i * 2];
-            expect_odd[i] = zeroed[i * 2 + 1];
-        }
-        let g = sha1(&[&expect_even]);
-        let h = sha1(&[&expect_odd]);
-        let mut expected = [0u8; 40];
-        for (i, (gi, hi)) in g.iter().zip(h.iter()).enumerate() {
-            expected[i * 2] = *gi;
-            expected[i * 2 + 1] = *hi;
-        }
-
-        assert_eq!(calculate_interleaved(&zeroed), expected);
-        assert_ne!(calculate_interleaved(&zeroed), calculate_interleaved(&s));
-    }
-
-    #[test]
-    fn calculate_x_known_answer() {
-        // The corpus writes the salt and `x` big-endian; we store both little-endian.
-        let salt: [u8; 32] = rev(hx(
-            "CAC94AF32D817BA64B13F18FDEDEF92AD4ED7EF7AB0E19E9F2AE13C828AEAF57",
-        ))
-        .try_into()
-        .unwrap();
-        let cases = [
-            (
-                "00XD0QOSA9L8KMXC",
-                "43R4Z35TKBKFW8JI",
-                "E2F9A0F1E824006C98DA753448E743F7DAA1EAA1",
-            ),
-            (
-                "01GJDP3DSFHR56JQ",
-                "9ZK1PFJ9LA0JSHPR",
-                "553A6123ABCFD539F2E0B77F64860C64675BC0FD",
-            ),
-        ];
-        for (user, pass, x_hex) in cases {
-            let x = calculate_x(
-                &NormalizedString::new(user).unwrap(),
-                &NormalizedString::new(pass).unwrap(),
-                &salt,
-            );
-            assert_eq!(x.to_vec(), rev(hx(x_hex)), "user={user}");
-        }
+    /// `M2 = SHA1( A | M1 | K )`, as realmd answers a proof it accepts.
+    fn server_proof(
+        client_public_key: &[u8; 32],
+        client_proof: &[u8; 20],
+        key: &[u8; 40],
+    ) -> [u8; 20] {
+        sha1::Sha1::new()
+            .chain_update(client_public_key)
+            .chain_update(client_proof)
+            .chain_update(key)
+            .finalize()
+            .into()
     }
 
     #[test]
@@ -576,16 +476,13 @@ mod tests {
                 LARGE_SAFE_PRIME_LITTLE_ENDIAN,
                 PublicKey::from_le_bytes(b).unwrap(),
                 salt,
-            );
+            )
+            .expect("a draw passes");
             assert!(is_width_stable(c.client_public_key()), "A, draw {i}");
-            assert!(is_width_stable(&c.session_key), "K, draw {i}");
+            assert!(is_width_stable(&c.session_key()), "K, draw {i}");
             assert!(is_width_stable(c.client_proof()), "M1, draw {i}");
             // The M2 we would check against is built from those same bytes, so it round-trips.
-            let m2 = calculate_server_proof(
-                &PublicKey::from_le_bytes(*c.client_public_key()).unwrap(),
-                c.client_proof(),
-                &c.session_key,
-            );
+            let m2 = server_proof(c.client_public_key(), c.client_proof(), &c.session_key());
             assert!(c.verify_server_proof(m2).is_ok(), "M2, draw {i}");
         }
     }
@@ -646,27 +543,26 @@ mod tests {
         52, 226, 21, 16, 93, 106, 129, 125, 56, 197, 129, 14, 149, 1, 254, 105, 63, 23, 9, 190, 46,
         113, 240, 125, 128, 130, 150, 46, 174, 240, 93, 249,
     ];
+    /// `A = g^a mod N` for [`CLEAN`].
+    const CLEAN_A: &str = "35f896d3776c62f3125d4be34a3ce13cc60a9a46354fc0ed5f2bf3c57a18d86c";
 
-    /// `A = g^a mod N` for a private key, as the constructor computes it.
-    fn public_key_of(private_key: &[u8; 32]) -> [u8; 32] {
-        let n = from_le(&LARGE_SAFE_PRIME_LITTLE_ENDIAN);
-        to_padded_32_le(&BigInt::from(GENERATOR).modpow(&from_le(private_key), &n))
+    fn fixture_challenge<R: RngCore>(rng: &mut R) -> SrpClientChallenge {
+        SrpClientChallenge::new_with_rng(
+            rng,
+            NormalizedString::new("alice").unwrap(),
+            NormalizedString::new("password1").unwrap(),
+            GENERATOR,
+            LARGE_SAFE_PRIME_LITTLE_ENDIAN,
+            PublicKey::from_le_bytes(FIXTURE_B).unwrap(),
+            FIXTURE_SALT,
+        )
+        .expect("the scripted draws end on one that passes")
     }
 
     /// Each guard gets a key known to trip it, then a clean one, and must return the clean draw.
     #[test]
     fn each_encoding_guard_rejects_the_draw_it_exists_for() {
-        let user = NormalizedString::new("alice").unwrap();
-        let pass = NormalizedString::new("password1").unwrap();
-        let server = PublicKey::from_le_bytes(FIXTURE_B).unwrap();
-        let clean_a = public_key_of(&CLEAN);
-
-        // The fixture still means what the vectors say: each trips its guard, CLEAN trips none.
-        assert!(
-            !is_width_stable(&public_key_of(&TRIPS_A)),
-            "TRIPS_A no longer trips A"
-        );
-        assert!(is_width_stable(&clean_a), "CLEAN no longer passes A");
+        let clean_a = hx(CLEAN_A);
 
         for (guard, bad) in [
             ("A", TRIPS_A),
@@ -675,18 +571,10 @@ mod tests {
             ("M1", TRIPS_M1),
         ] {
             let mut rng = Scripted([bad, CLEAN].into_iter().collect());
-            let c = SrpClientChallenge::new_with_rng(
-                &mut rng,
-                user.clone(),
-                pass.clone(),
-                GENERATOR,
-                LARGE_SAFE_PRIME_LITTLE_ENDIAN,
-                server,
-                FIXTURE_SALT,
-            );
+            let c = fixture_challenge(&mut rng);
             assert_eq!(
-                c.client_public_key(),
-                &clean_a,
+                c.client_public_key().to_vec(),
+                clean_a,
                 "guard {guard}: the tripping draw was accepted instead of the clean one"
             );
             assert!(
@@ -694,23 +582,50 @@ mod tests {
                 "guard {guard}: the clean draw was never reached"
             );
             assert!(is_width_stable(c.client_public_key()));
-            assert!(is_width_stable(&c.session_key));
+            assert!(is_width_stable(&c.session_key()));
             assert!(is_width_stable(c.client_proof()));
         }
 
         // And a draw that trips nothing is taken first time.
         let mut rng = Scripted([CLEAN, TRIPS_A].into_iter().collect());
-        let c = SrpClientChallenge::new_with_rng(
-            &mut rng,
-            user,
-            pass,
-            GENERATOR,
-            LARGE_SAFE_PRIME_LITTLE_ENDIAN,
-            server,
-            FIXTURE_SALT,
-        );
-        assert_eq!(c.client_public_key(), &clean_a);
+        let c = fixture_challenge(&mut rng);
+        assert_eq!(c.client_public_key().to_vec(), clean_a);
         assert_eq!(rng.0.len(), 1, "a clean first draw is the handshake");
+    }
+
+    #[test]
+    fn a_group_other_than_the_clients_is_refused() {
+        let challenge = |generator, prime| {
+            SrpClientChallenge::new(
+                NormalizedString::new("alice").unwrap(),
+                NormalizedString::new("password1").unwrap(),
+                generator,
+                prime,
+                PublicKey::from_le_bytes(FIXTURE_B).unwrap(),
+                FIXTURE_SALT,
+            )
+        };
+        let mut other_prime = LARGE_SAFE_PRIME_LITTLE_ENDIAN;
+        other_prime[0] ^= 2;
+
+        assert!(matches!(
+            challenge(2, LARGE_SAFE_PRIME_LITTLE_ENDIAN),
+            Err(SrpError::UnknownGroup)
+        ));
+        assert!(matches!(
+            challenge(GENERATOR, other_prime),
+            Err(SrpError::UnknownGroup)
+        ));
+    }
+
+    #[test]
+    fn a_colon_in_the_account_name_is_refused() {
+        let name = NormalizedString::new("al:ice").unwrap();
+        let pass = NormalizedString::new("password1").unwrap();
+        assert!(matches!(
+            password_verifier(&name, &pass, &FIXTURE_SALT),
+            Err(SrpError::InvalidUsername)
+        ));
     }
 
     #[test]
@@ -718,7 +633,7 @@ mod tests {
         let user = NormalizedString::new("alice").unwrap();
         let pass = NormalizedString::new("password1").unwrap();
         for _ in 0..2048 {
-            let (salt, _) = generate_account(&user, &pass);
+            let (salt, _) = generate_account(&user, &pass).unwrap();
             assert!(is_width_stable(&salt));
         }
     }
@@ -730,11 +645,38 @@ mod tests {
             &NormalizedString::new("alice").unwrap(),
             &NormalizedString::new("password1").unwrap(),
             &salt,
-        );
+        )
+        .unwrap();
         assert_eq!(
             v.to_vec(),
             hx("28b837075a12b82553921d9095fa3fdcb0151c4bfc860ab97a69d0fa86a3d213")
         );
+    }
+
+    #[test]
+    fn handshake_golden() {
+        let mut rng = Scripted([CLEAN].into_iter().collect());
+        let c = fixture_challenge(&mut rng);
+        assert_eq!(c.client_public_key().to_vec(), hx(CLEAN_A));
+        assert_eq!(
+            c.client_proof().to_vec(),
+            hx("4b706ee7e19d1151451684860cbd1fcd02d71bec")
+        );
+        let m2: [u8; 20] = hx("76b7db2b48435911fb013bbf2fbe35df69fa27e1")
+            .try_into()
+            .unwrap();
+        let client = c.verify_server_proof(m2).expect("the golden M2 verifies");
+        assert_eq!(
+            client.session_key().to_vec(),
+            hx("e5d5d1ed870112db554579245befc674df740dd1aab9d42c380b73e9784efa0a893c4816d97df547")
+        );
+    }
+
+    #[test]
+    fn a_wrong_server_proof_is_refused() {
+        let mut rng = Scripted([CLEAN].into_iter().collect());
+        let c = fixture_challenge(&mut rng);
+        assert!(c.verify_server_proof([0x5a; 20]).is_err());
     }
 
     #[test]

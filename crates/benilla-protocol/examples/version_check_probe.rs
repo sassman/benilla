@@ -73,7 +73,8 @@ fn attempt(host: &str, port: u16, user: &str, pass: &str, arm: Arm) -> Result<Op
             reply.large_safe_prime,
             b,
             reply.salt,
-        );
+        )
+        .context("computing the logon proof")?;
         let salt = match arm {
             Arm::Computed => reply.crc_salt,
             Arm::Zeros => [0u8; 16],

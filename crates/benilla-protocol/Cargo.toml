@@ -26,3 +26,5 @@ libc = "0.2"
 [dev-dependencies]
 # The SRP probe example re-derives the handshake by hand, to vary what `benilla-srp` fixes.
 num-bigint = "0.4.6"
+# The server side of the strong logon, for the fake realmd the logon tests dial.
+srp6.workspace = true

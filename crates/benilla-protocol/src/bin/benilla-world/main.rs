@@ -41,6 +41,9 @@ struct Cli {
     /// World server address (`host:port`). Defaults to the realm list's advertised address.
     #[arg(long)]
     world: Option<String>,
+    /// Speak the strong handshake (4096-bit group, SHA-512), which no 1.12.1 realmd knows.
+    #[arg(long)]
+    strong: bool,
     /// Character name to create if the account has none.
     #[arg(long, default_value = "One")]
     create: String,
@@ -201,11 +204,17 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // 1. realmd logon: session key and realm list.
-    let logon = benilla_protocol::logon(
+    let handshake = if cli.strong {
+        benilla_protocol::Handshake::Strong
+    } else {
+        benilla_protocol::Handshake::Stock
+    };
+    let logon = benilla_protocol::logon_as(
         &cli.host,
         &cli.username,
         &cli.password,
         benilla_protocol::auth::LOCALE_TAG_EN_US,
+        handshake,
     )?;
     println!("authenticated as '{}'", cli.username);
 
@@ -220,7 +229,7 @@ fn main() -> Result<()> {
     };
 
     // 3. World handshake (CMSG_AUTH_SESSION + header obfuscation).
-    let mut session = WorldSession::connect(&world_addr, &cli.username, logon.session_key)
+    let mut session = WorldSession::connect(&world_addr, &cli.username, &logon.session_key)
         .with_context(|| format!("world handshake with {world_addr}"))?;
     println!("world handshake OK ({world_addr}) — header obfuscation active");
 

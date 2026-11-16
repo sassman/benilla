@@ -17,6 +17,9 @@ too_many_arguments = "allow"
 
 [workspace.dependencies]
 anyhow = "1.0.102"
+# The SRP6 arithmetic of both logon handshakes. `wow-1-12-1` brings the 1.12.1 flavour; the
+# strong one needs no feature.
+srp6 = { git = "https://github.com/sassman/srp6-rs", rev = "d477b731267791b36ec7d88d060ad82506af3cd8", default-features = false, features = ["wow-1-12-1"] }
 # bevy's default features spelled out without `audio`: `2d`, `3d` and `ui` each pull `bevy_audio`
 # and `vorbis`, and the client mixes through kira. Add a feature by name, never `2d`/`3d`/`ui`; a
 # plugin that takes bevy with its default features brings the audio stack back too.
